@@ -1,0 +1,152 @@
+---
+title: "Data Exploration"
+author: "Christine Rich"
+date: "2/19/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preparing the Data
+
+To first start this data exploration, I first needed to load in the data and the necessary libraries.
+
+```{r, message=FALSE}
+#Load libraries
+library(tidyverse)
+library(purrr)
+library(vtable)
+library(ggplot2)
+library(jtools)
+library(car)
+```
+
+```{r message=FALSE, warning=FALSE}
+#Read trend files
+trend_files <- list.files(path="../Raw Data", pattern="trends_up_to", full.names=TRUE)
+kw_trends <- trend_files %>% 
+  map_dfr(read_csv, .id="source") %>% 
+  #Remove rows without a schid or a schname or an index
+  filter(!is.na(schid) & !is.na(schname) & !is.na(index)) %>% 
+  #Divide month or week into start and end dates
+  mutate(start_date=as.Date(str_sub(monthorweek,1,10))) %>%
+  mutate(end_date=as.Date(str_sub(monthorweek,14,23)))
+#Remove rows not in the year before scorecard released or in year after release
+kw_trends <- kw_trends %>% filter(start_date >= as.Date("2014-09-01") & end_date <= as.Date("2016-08-31"))
+```
+
+Using the map_dfr function from the Purrr package, I was able to load in all of the keyword trend files. I chose to filter out all rows that contained an NA in the schid, schname or index columns. I also made sure to convert the monthorweek column into separate dates and converted them into a Date type. In order to only analyze the data in the year before the release to the year after the release, I filtered out all rows outside of that date range. It seemed like including that date range would be most relevant concerning when the College Scorecard was released.
+
+```{r message=FALSE, warning=FALSE}
+#Read data dictionary
+data_dict <- read_csv("../Raw Data/CollegeScorecardDataDictionary-09-08-2015.csv")
+
+#Read id/name link
+id_name <- read_csv("../Raw Data/id_name_link.csv")
+
+#Read most recent cohorts
+cohorts <- read_csv("../Raw Data/Most+Recent+Cohorts+(Scorecard+Elements).csv")
+```
+
+```{r}
+#Find duplicate school names
+dups <- id_name %>% group_by(schname) %>% summarise(name_count = n()) %>% filter(name_count > 1)
+
+#Get unit ID's of duplicates
+dup_unitid <- id_name %>% filter(schname %in% dups$schname)
+
+#Remove duplicates
+kw_trends <- kw_trends %>% filter(!(schname %in% dups$schname))
+cohorts <- cohorts %>% filter(!(UNITID %in% dup_unitid$unitid))
+```
+
+After loading in the data, I searched the data for duplicate college names by grouping by school name in the id_name_link data frame and counting the number of times the school appeared. I then filtered those schools out from the trend data frame and the cohorts data frame if the count was greater than 1.
+
+```{r}
+#Filter to bachelor degree predominant colleges
+cohorts <- cohorts %>% filter(PREDDEG == 3)
+```
+
+Since the analysis prompt specified bachelor degree predominant colleges, I filtered the cohorts data set to include only those colleges. Those colleges would get filtered out of the trends data frame in the future when I do an inner join between the two data frames.
+
+```{r message=FALSE, warning=FALSE}
+#Standardize keyword index scores
+keywords_means <- kw_trends %>% group_by(keyword, schname) %>% summarise(mean = mean(index), sd=sd(index))
+kw_trends_new <- left_join(kw_trends, keywords_means, by=c("keyword"="keyword", "schname"="schname"))
+trends_standardized <- kw_trends_new %>% mutate(index_standardized = (index - mean)/sd) %>% 
+  select(schname, keyword, index_standardized, start_date, end_date)
+
+trends_standardized <- trends_standardized %>% 
+  #Filter to the year after Scorecard released
+  filter(start_date >= as.Date("2015-09-01") & end_date <= as.Date("2016-08-31"))
+
+#Group data to be avg index/college for year after Scorecard released
+school_index_scores <- trends_standardized %>% group_by(schname) %>% summarise(avg_index=mean(index_standardized))
+```
+
+I thought it would be best to standardize the index scores to perform this analysis. I started with grouping the keyword trend data by keyword and school name, then finding the mean and standard deviation of the index for each group. Then I joined the summarized data frame back to the original keyword trends data frame, so that I could make the index_standardized column, which is the index minus the mean, divided by the standard deviation. Then, to only analyze keyword search performance after the scorecard was released, I filtered the trend data to only include rows following the start of September 2015. Finally, I averaged the index scores, grouping at the school level. This seemed the best way to compare index values between schools.
+
+```{r message=FALSE, warning=FALSE}
+#Join cohorts to index scores data frame
+master_df <- inner_join(school_index_scores, id_name, by=c("schname" = "schname"))
+master_df <- inner_join(master_df, cohorts, by=c("unitid"="UNITID", "opeid"="OPEID"))
+
+model_df <- master_df %>% select(schname, avg_index, `md_earn_wne_p10-REPORTED-EARNINGS`, LOCALE, CONTROL, GRAD_DEBT_MDN_SUPP) %>%
+  mutate(LOCALE=as.integer(LOCALE)) %>%
+  mutate(GRAD_DEBT_MDN_SUPP=as.integer(GRAD_DEBT_MDN_SUPP)) %>% filter(!is.na(GRAD_DEBT_MDN_SUPP))
+```
+
+Finally, I join the data frame with the average index scores to the id/name link table, and then join to the scorecard data. I create a data frame that will be used in the model, selecting columns that may be used.
+
+```{r}
+#Create locale and control dummy variables
+locale_id <- c(11, 12, 13, 21, 22, 23, 31, 32, 33, 41, 42, 43)
+locale_type <- c("City", "City", "City", "Suburb", "Suburb", "Suburb", "Town", "Town", "Town", "Rural", "Rural", "Rural")
+locale_df <- data.frame(locale_id, locale_type)
+model_df <- inner_join(model_df, locale_df, by=c("LOCALE"="locale_id")) 
+model_df <- model_df %>%  
+  mutate(city = locale_type=="City") %>%
+  mutate(suburb=locale_type=="Suburb") %>%
+  mutate(town=locale_type=="Town") %>%
+  mutate(rural=locale_type=="Rural")
+control_df <- data.frame(control_id=c(1,2,3), control_name=c("Public", "Private (Nonprofit)", "Private (For-Profit)"))
+model_df <- inner_join(model_df, control_df, by=c("CONTROL"="control_id"))
+model_df <- model_df %>%
+  mutate(public = control_name=="Public") %>%
+  mutate(nonprofit = control_name=="Private (Nonprofit)") %>%
+  mutate(forprofit = control_name=="Private (For-Profit)")
+```
+
+I created more user-friendly columns for the control and locale variables, because I thought they could be useful for the analysis. I only used the control variable in the actual analysis, though.
+
+```{r message=FALSE, warning=FALSE}
+#Remove non-numeric income rows
+model_df <- model_df %>% mutate(earnings=as.integer(`md_earn_wne_p10-REPORTED-EARNINGS`)) %>% filter(!is.na(earnings))
+
+#Assign earnings groups
+model_df <- model_df %>%
+  mutate(earning_group = ifelse(earnings < mean(earnings) - sd(earnings)/2,'Low', 
+                                ifelse(earnings > mean(earnings) + sd(earnings)/2, 'High', 'Med')))
+```
+## Analysis
+
+To assign the high/low earning groups, I considered the low earnings group to earn below the mean earnings minus half the standard deviation, and the high earnings group earns more than the mean earnings plus half the standard deviation.There is a third group named Med that earns between the standard deviation values. This seems to lead to a number of points in each group such that the majority are in Med and the more extreme values are in the low and high groups.
+
+```{r}
+lm <- lm(data=model_df, avg_index ~ earning_group + control_name)
+export_summs(lm)
+```
+
+The model used in this analysis regresses average index value on earning group and control (control being whether it is a public/private for-profit/private nonprofit). In the model summary, we can see that, controlling for the control type, the standardized index value for low earning colleges increases by .04 more than the high earning group, with the p-value being statistically significant at alpha=.05. Interestingly, for the medium earning group, the standardized index value increases slightly less by .03 compared to the high earning group when controlling for the control type, and this is a statistically significant value at alpha=.001.
+
+```{r}
+effect_plot(lm, earning_group, plot.points = TRUE)
+```
+
+In this effect plot, we can see that the low earning group has the highest average index, and that the high earning group has the lowest. Although, each group has a negative average index value.
+
+## Conclusion
+
+In conclusion, it appears that the earning group has a statistically significant effect on the index value of the college's keyword search trend. However, it appears that a college with a higher earning cohort does not cause the index of keyword trends to increase more than a college with a lower earning cohort.
